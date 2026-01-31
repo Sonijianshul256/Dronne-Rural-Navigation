@@ -1,0 +1,7 @@
+{
+  "name": "Dronne Rural navigation",
+  "description": "An intelligent offline navigation app with sensor-fusion dead reckoning for rural areas with intermittent GPS.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
