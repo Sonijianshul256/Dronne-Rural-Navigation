@@ -82,6 +82,7 @@ interface MapViewProps {
   targetLocation: Coordinates | null;
   waypoints?: Coordinates[];
   routeCoordinates?: Coordinates[];
+  recordedTrack?: Coordinates[]; // OsmAnd feature: Breadcrumb trail
   mode: TransportMode;
   onBoundsChange?: (bounds: MapBounds) => void;
   onMapClick?: (coords: Coordinates) => void;
@@ -89,7 +90,7 @@ interface MapViewProps {
 }
 
 export const MapView: React.FC<MapViewProps> = ({ 
-  location, heading, speed, isGpsActive, targetLocation, waypoints = [], routeCoordinates, mode, onBoundsChange, onMapClick, onMapLongPress 
+  location, heading, speed, isGpsActive, targetLocation, waypoints = [], routeCoordinates, recordedTrack = [], mode, onBoundsChange, onMapClick, onMapLongPress 
 }) => {
   const mapRef = useRef<L.Map | null>(null);
   const userMarkerRef = useRef<L.Marker | null>(null);
@@ -97,6 +98,7 @@ export const MapView: React.FC<MapViewProps> = ({
   const waypointMarkersRef = useRef<L.Marker[]>([]);
   const circleRef = useRef<L.Circle | null>(null);
   const routeLineRef = useRef<L.Polyline | null>(null);
+  const trackLineRef = useRef<L.Polyline | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
   
   // Accumulated rotation to prevent spinner-effect when crossing 0/360 boundary
@@ -104,6 +106,7 @@ export const MapView: React.FC<MapViewProps> = ({
 
   // Layer Groups for Controls
   const routeLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const trackLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const waypointsLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const accuracyLayerGroupRef = useRef<L.LayerGroup | null>(null);
 
@@ -130,10 +133,12 @@ export const MapView: React.FC<MapViewProps> = ({
 
     // Initialize Overlay Groups
     const routeGroup = L.layerGroup().addTo(map);
+    const trackGroup = L.layerGroup().addTo(map);
     const waypointsGroup = L.layerGroup().addTo(map);
     const accuracyGroup = L.layerGroup().addTo(map);
 
     routeLayerGroupRef.current = routeGroup;
+    trackLayerGroupRef.current = trackGroup;
     waypointsLayerGroupRef.current = waypointsGroup;
     accuracyLayerGroupRef.current = accuracyGroup;
 
@@ -142,6 +147,7 @@ export const MapView: React.FC<MapViewProps> = ({
       { "Standard": standardLayer, "Satellite": satelliteLayer, "Terrain": terrainLayer }, 
       { 
         "Route Path": routeGroup, 
+        "Recorded Track": trackGroup,
         "Waypoints": waypointsGroup, 
         "GPS Accuracy": accuracyGroup 
       }, 
@@ -190,11 +196,15 @@ export const MapView: React.FC<MapViewProps> = ({
     if (diff < -180) diff += 360;
     visualHeadingRef.current += diff;
 
+    // Visual State: Green for GPS, Amber/Orange for Dead Reckoning
+    const markerColor = isGpsActive ? 'border-b-blue-600' : 'border-b-amber-500';
+
     if (!userMarkerRef.current) {
       // Custom DivIcon for the user marker (Vehicle/Arrow)
+      // The color changes dynamically via ID manipulation below to avoid re-creating the marker
       const userIcon = L.divIcon({
         className: 'bg-transparent',
-        html: `<div id="user-heading-marker" class="w-0 h-0 border-l-[8px] border-l-transparent border-b-[20px] border-b-blue-600 border-r-[8px] border-r-transparent filter drop-shadow-md transition-transform duration-200 ease-linear" style="transform: rotate(${visualHeadingRef.current}deg);"></div>`,
+        html: `<div id="user-heading-marker" class="w-0 h-0 border-l-[8px] border-l-transparent border-b-[20px] ${markerColor} border-r-[8px] border-r-transparent filter drop-shadow-md transition-transform duration-200 ease-linear" style="transform: rotate(${visualHeadingRef.current}deg);"></div>`,
         iconSize: [16, 20],
         iconAnchor: [8, 10]
       });
@@ -202,10 +212,18 @@ export const MapView: React.FC<MapViewProps> = ({
     } else {
       userMarkerRef.current.setLatLng([location.lat, location.lng]);
       
-      // Update heading rotation efficiently via direct DOM access
+      // Update heading rotation and color efficiently via direct DOM access
       const el = document.getElementById('user-heading-marker');
       if (el) {
         el.style.transform = `rotate(${visualHeadingRef.current}deg)`;
+        // Update color class for DR vs GPS
+        if (isGpsActive) {
+            el.classList.add('border-b-blue-600');
+            el.classList.remove('border-b-amber-500');
+        } else {
+            el.classList.add('border-b-amber-500');
+            el.classList.remove('border-b-blue-600');
+        }
       }
     }
 
@@ -322,6 +340,28 @@ export const MapView: React.FC<MapViewProps> = ({
     }
 
   }, [routeCoordinates, waypoints, targetLocation, mode]); 
+
+  // Draw Recorded Track (Breadcrumbs) - OsmAnd Style
+  useEffect(() => {
+    if (!trackLayerGroupRef.current) return;
+    
+    // Remove existing track line if any
+    if (trackLineRef.current) trackLineRef.current.remove();
+
+    if (recordedTrack.length > 1) {
+        const path = recordedTrack.map(c => [c.lat, c.lng] as [number, number]);
+        
+        // Red dashed line for recording
+        trackLineRef.current = L.polyline(path, {
+            color: '#ef4444', // Red-500
+            weight: 4,
+            opacity: 0.6,
+            dashArray: '5, 10',
+            lineCap: 'butt'
+        });
+        trackLineRef.current.addTo(trackLayerGroupRef.current);
+    }
+  }, [recordedTrack]);
 
   return (
     <div className="relative w-full h-full">

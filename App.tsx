@@ -3,7 +3,7 @@ import {
   MapPin, Navigation, Signal, WifiOff, Wifi, 
   Battery, Footprints, Bike, Car, Menu, Compass,
   AlertTriangle, Save, CloudOff, Download, CheckCircle, XCircle, Layers, Settings, Sliders, Cpu, Trash2, Database, Map as MapIcon,
-  ArrowUp, CornerUpLeft, CornerUpRight, ArrowLeft, ArrowRight, Flag
+  ArrowUp, CornerUpLeft, CornerUpRight, ArrowLeft, ArrowRight, Flag, Circle, CircleDot, Disc
 } from 'lucide-react';
 import { Coordinates, SensorReadings, TransportMode, NavigationMode, MapBounds, RoutingOptions, SensorCalibration } from './types';
 import { DEFAULT_START_LOCATION, WALKING_SPEED_MPS, BIKE_SPEED_MPS, CAR_SPEED_MPS, MAX_TILES_PER_DOWNLOAD } from './constants';
@@ -48,6 +48,11 @@ const App: React.FC = () => {
   });
 
   const [showSensors, setShowSensors] = useState(false);
+
+  // --- Track Recording (OsmAnd Style) ---
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedTrack, setRecordedTrack] = useState<Coordinates[]>([]);
+  const lastRecordPos = useRef<Coordinates | null>(null);
   
   // Navigation Instruction State
   const [nextManeuver, setNextManeuver] = useState<{ type: string; distance: number; text: string } | null>(null);
@@ -162,138 +167,119 @@ const App: React.FC = () => {
         let targetIdx = nextRoutePointIndexRef.current;
         if (targetIdx >= routeCoordinates.length) targetIdx = routeCoordinates.length - 1;
 
-        const pCurrent = currentLocation;
+        // --- 1. DUAL LOOKAHEAD PREDICTION SYSTEM ---
         
-        // --- 1. PURE PURSUIT STEERING ---
-        // Calculate a look-ahead point on the path based on speed
-        // Higher speed = further look-ahead = smoother, cutting corners
-        const steeringLookAhead = Math.max(12, currentSpeed * 2.8); 
-        
-        let pursuitPoint = routeCoordinates[targetIdx];
-        let accumulatedDist = calculateDistance(pCurrent, routeCoordinates[targetIdx]);
-        
-        // Iterate forward to find the point exactly `steeringLookAhead` meters away along the path
-        let scanIdx = targetIdx;
-        let pointFound = false;
+        // Steering Lookahead: Close range for precision (10m - 30m)
+        const steerDist = Math.max(10, currentSpeed * 1.5); 
+        // Braking Lookahead: Long range for detecting curvature early (40m - 100m)
+        const brakeDist = Math.max(40, currentSpeed * 4.0);
 
-        // Start checking from current position to next point
-        // Note: calculateDistance(pCurrent, routeCoordinates[targetIdx]) is already in accumulatedDist
-        
-        // If the immediate next point is far enough, interpolate on the current segment
-        // We approximate the start of the "path" as the current location for lookahead purposes
-        if (accumulatedDist > steeringLookAhead) {
-            // Interpolate between current and targetIdx
-            // Note: This is a simplification. Strictly we should project pCurrent onto the segment.
-            // But for simulation, interpolating pCurrent -> pNext works well enough if close.
-             const ratio = steeringLookAhead / accumulatedDist;
-             pursuitPoint = {
-                lat: pCurrent.lat + (routeCoordinates[targetIdx].lat - pCurrent.lat) * ratio,
-                lng: pCurrent.lng + (routeCoordinates[targetIdx].lng - pCurrent.lng) * ratio
-             };
-             pointFound = true;
-        } else {
-             // Look further ahead
-             while (scanIdx < routeCoordinates.length - 1) {
-                const pStart = routeCoordinates[scanIdx];
-                const pEnd = routeCoordinates[scanIdx + 1];
-                const segLen = calculateDistance(pStart, pEnd);
-                
-                if (accumulatedDist + segLen >= steeringLookAhead) {
-                    // Interpolate point on this segment
-                    const remaining = steeringLookAhead - accumulatedDist;
-                    const ratio = remaining / segLen;
-                    
-                    pursuitPoint = {
-                        lat: pStart.lat + (pEnd.lat - pStart.lat) * ratio,
-                        lng: pStart.lng + (pEnd.lng - pStart.lng) * ratio
-                    };
-                    pointFound = true;
-                    break;
-                }
-                
-                accumulatedDist += segLen;
-                scanIdx++;
-            }
-            if (!pointFound) {
-                // End of path
-                pursuitPoint = routeCoordinates[routeCoordinates.length - 1];
-            }
-        }
-
-        const desiredBearing = calculateBearing(pCurrent, pursuitPoint);
-
-        // --- 2. CURVATURE-BASED SPEED CONTROL ---
-        // Look ahead for sharp turns to apply braking
-        let curvatureSeverity = 0;
-        const maxSpeedScanDist = Math.max(60, currentSpeed * 5); // Look 5 seconds ahead
-        
-        // Scan ahead for sharp angles relative to the path flow
-        // We look at the change in bearing between subsequent segments
-        for (let i = targetIdx; i < Math.min(routeCoordinates.length - 2, targetIdx + 15); i++) {
-             const p1 = routeCoordinates[i];
-             const p2 = routeCoordinates[i+1];
-             const p3 = routeCoordinates[i+2];
+        // Helper to find exact point X meters along the path from current position
+        const getPointAtDist = (nextIdx: number, dist: number): Coordinates => {
+             let remaining = dist;
              
-             // Approximate distance from vehicle to this turn (p1)
-             // Simple sum not perfect but fast
-             const distToTurn = calculateDistance(pCurrent, p1); 
-             if (distToTurn > maxSpeedScanDist) break;
-
-             const b1 = calculateBearing(p1, p2);
-             const b2 = calculateBearing(p2, p3);
-             let diff = Math.abs(b1 - b2);
-             if (diff > 180) diff = 360 - diff;
+             // First segment: Current Pos -> Next Route Point
+             let p1 = currentLocation;
+             let p2 = routeCoordinates[nextIdx];
+             let segLen = calculateDistance(p1, p2);
              
-             if (diff > 15) {
-                 // Calculate severity factor
-                 // 90 degree turn = 1.0, 45 degree = 0.5
-                 const turnFactor = Math.pow(diff / 90, 1.5); // Exponential punishment for sharp turns
-                 
-                 // Weight by distance: Immediate turns require drastic speed reduction
-                 // Turns far away have less weight
-                 const weight = Math.max(0, 1 - (distToTurn / maxSpeedScanDist));
-                 
-                 curvatureSeverity += turnFactor * weight;
+             if (remaining <= segLen) {
+                 // Interpolate
+                 const ratio = remaining / segLen;
+                 return {
+                     lat: p1.lat + (p2.lat - p1.lat) * ratio,
+                     lng: p1.lng + (p2.lng - p1.lng) * ratio
+                 };
              }
-        }
+             
+             remaining -= segLen;
+             let i = nextIdx;
+             
+             // Subsequent segments: Node -> Node
+             while (i < routeCoordinates.length - 1) {
+                 p1 = routeCoordinates[i];
+                 p2 = routeCoordinates[i+1];
+                 segLen = calculateDistance(p1, p2);
+                 
+                 if (remaining <= segLen) {
+                     const ratio = remaining / segLen;
+                     return {
+                         lat: p1.lat + (p2.lat - p1.lat) * ratio,
+                         lng: p1.lng + (p2.lng - p1.lng) * ratio
+                     };
+                 }
+                 remaining -= segLen;
+                 i++;
+             }
+             
+             return routeCoordinates[routeCoordinates.length - 1];
+        };
 
+        // Determine Waypoint Progress
+        const distToNext = calculateDistance(currentLocation, routeCoordinates[targetIdx]);
+        if (distToNext < Math.max(5, currentSpeed)) {
+           if (nextRoutePointIndexRef.current < routeCoordinates.length - 1) {
+              nextRoutePointIndexRef.current += 1;
+              setNextRoutePointIndex(nextRoutePointIndexRef.current);
+           }
+        }
+        
+        // Calculate Target Points
+        const steerTarget = getPointAtDist(targetIdx, steerDist);
+        const brakeTarget = getPointAtDist(targetIdx, brakeDist);
+
+        // --- 2. PHYSICS CALCULATION ---
+
+        // Desired Heading (Steering)
+        const bearingToSteer = calculateBearing(currentLocation, steerTarget);
+        
+        // Curvature Detection
+        // Calculate the angle between the "Steering Vector" and "Braking Vector"
+        // If they diverge significantly, a turn is coming up.
+        const bearingToBrake = calculateBearing(currentLocation, brakeTarget);
+        
+        let curveAngle = Math.abs(bearingToSteer - bearingToBrake);
+        if (curveAngle > 180) curveAngle = 360 - curveAngle;
+        
+        // Current Heading Error (Are we drifting?)
+        let headingError = bearingToSteer - calculatedHeading;
+        while (headingError < -180) headingError += 360;
+        while (headingError > 180) headingError -= 360;
+
+        // Calculate Target Speed based on Curvature
         let baseMaxSpeed = WALKING_SPEED_MPS;
         if (mode === TransportMode.BIKE) baseMaxSpeed = BIKE_SPEED_MPS;
         if (mode === TransportMode.CAR) baseMaxSpeed = CAR_SPEED_MPS;
 
-        // Apply speed reduction
-        // If curvatureSeverity is high (e.g., 1.0), we slow down to ~20-30% of max speed
-        const speedFactor = Math.max(0.25, 1 / (1 + curvatureSeverity * 2.0));
+        // Severity = Combination of upcoming curve + current misalignment
+        const curvatureSeverity = (curveAngle * 1.8) + (Math.abs(headingError) * 0.5);
+        
+        // Speed Factor: 
+        // 0 deg curve = 100% speed
+        // 90 deg curve = ~30% speed
+        const speedFactor = Math.max(0.3, 1.0 - (curvatureSeverity / 70));
+        
         const targetSpeed = baseMaxSpeed * speedFactor;
-
 
         // --- 3. PHYSICS UPDATE ---
         
-        // Acceleration / Braking
+        // Acceleration / Deceleration
         if (currentSpeed < targetSpeed) {
-           const accel = mode === TransportMode.CAR ? 3.5 : 1.5;
-           calculatedSpeed = currentSpeed + (accel * deltaTime);
-           if (calculatedSpeed > targetSpeed) calculatedSpeed = targetSpeed;
+            // Accelerate smoothly
+            calculatedSpeed = currentSpeed + (2.5 * deltaTime);
         } else {
-           // Braking is stronger than acceleration
-           const brake = 6.0 + (currentSpeed - targetSpeed); // Progressive braking
-           calculatedSpeed = currentSpeed - (brake * deltaTime);
-           if (calculatedSpeed < targetSpeed) calculatedSpeed = targetSpeed;
+            // Brake harder than accelerate (Safety)
+            calculatedSpeed = currentSpeed - (5.0 * deltaTime);
         }
-        calculatedSpeed = Math.max(0.5, calculatedSpeed);
+        calculatedSpeed = Math.max(0.5, Math.min(calculatedSpeed, baseMaxSpeed));
 
-        // Heading Update (Steering Inertia)
-        let headingError = desiredBearing - calculatedHeading;
-        while (headingError < -180) headingError += 360;
-        while (headingError > 180) headingError -= 360;
-
-        // Max turn rate drops as speed increases (stability)
-        // High speed = cant turn fast
-        const maxTurnRate = Math.max(45, 140 - (currentSpeed * 3)); 
+        // Heading / Steering
+        // Limit turn rate based on speed (Vehicle dynamics: fast = wide turns)
+        const maxTurnRate = Math.max(35, 120 - (currentSpeed * 2.5)); 
         const turnStep = maxTurnRate * deltaTime;
 
         if (Math.abs(headingError) <= turnStep) {
-           calculatedHeading = desiredBearing;
+           calculatedHeading = bearingToSteer;
         } else {
            calculatedHeading += Math.sign(headingError) * turnStep;
         }
@@ -304,20 +290,6 @@ const App: React.FC = () => {
         const moveDist = calculatedSpeed * deltaTime;
         setCurrentLocation(prev => calculateNewPosition(prev, moveDist, calculatedHeading));
 
-        // --- 5. WAYPOINT SWITCHING ---
-        // Determine distance to next waypoint
-        const distToNext = calculateDistance(pCurrent, routeCoordinates[targetIdx]);
-        
-        // Dynamic hit radius: larger when moving fast to avoid missing it
-        const hitRadius = Math.max(6, currentSpeed * 1.5);
-        
-        if (distToNext < hitRadius) {
-           if (nextRoutePointIndexRef.current < routeCoordinates.length - 1) {
-              nextRoutePointIndexRef.current += 1;
-              setNextRoutePointIndex(nextRoutePointIndexRef.current);
-           }
-        }
-        
       } 
       // --- DEAD RECKONING / FREE MOVEMENT ---
       else if (!gpsActive || (gpsActive && isSimulatingMove)) {
@@ -349,10 +321,21 @@ const App: React.FC = () => {
 
       // Update Speed State (Throttled check to avoid render spam when idle)
       setCurrentSpeed(prev => Math.abs(prev - calculatedSpeed) > 0.1 ? calculatedSpeed : prev);
+
+      // --- TRACK RECORDING (OsmAnd Feature) ---
+      if (isRecording) {
+         // Only add point if moved significantly (> 5 meters) to save memory/visual clutter
+         const dist = lastRecordPos.current ? calculateDistance(currentLocation, lastRecordPos.current) : 100;
+         if (dist > 5) {
+             setRecordedTrack(prev => [...prev, currentLocation]);
+             lastRecordPos.current = currentLocation;
+         }
+      }
+
     }
     lastTimeRef.current = time;
     requestRef.current = requestAnimationFrame(animate);
-  }, [gpsActive, sensors, isSimulatingMove, mode, navState, routeCoordinates, currentLocation, calibration, currentSpeed]);
+  }, [gpsActive, sensors, isSimulatingMove, mode, navState, routeCoordinates, currentLocation, calibration, currentSpeed, isRecording]);
 
   useEffect(() => {
     if (hasStarted) {
@@ -471,6 +454,17 @@ const App: React.FC = () => {
     if (navState === NavigationMode.NAVIGATING && targetLocation) {
         // Trigger re-route logic (handled by effect or we call directly)
     }
+  };
+
+  const handleToggleRecording = () => {
+      if (isRecording) {
+          setIsRecording(false);
+          // Optional: Save to local storage or prompt to save
+      } else {
+          setRecordedTrack([currentLocation]); // Start with current point
+          lastRecordPos.current = currentLocation;
+          setIsRecording(true);
+      }
   };
 
   // Re-calculate route if options change while navigating
@@ -652,6 +646,7 @@ const App: React.FC = () => {
             targetLocation={targetLocation}
             waypoints={waypoints}
             routeCoordinates={routeCoordinates}
+            recordedTrack={recordedTrack}
             mode={mode}
             onBoundsChange={setCurrentMapBounds}
             onMapClick={(coords) => handleSetDestination(coords)}
@@ -692,9 +687,17 @@ const App: React.FC = () => {
            </div>
         )}
 
+        {/* Recording Indicator */}
+        {isRecording && (
+          <div className="absolute top-28 right-4 bg-red-600 text-white px-3 py-1 rounded-full shadow-lg z-[500] flex items-center gap-2 text-xs font-bold animate-pulse pointer-events-none">
+            <Disc className="w-3 h-3" />
+            REC
+          </div>
+        )}
+
         {/* Dead Reckoning Alert Overlay */}
         {!gpsActive && (
-          <div className="absolute top-28 left-1/2 -translate-x-1/2 bg-amber-600/90 text-white px-4 py-2 rounded-full shadow-lg z-[500] flex items-center gap-2 text-sm font-bold animate-pulse pointer-events-none">
+          <div className="absolute top-36 left-1/2 -translate-x-1/2 bg-amber-600/90 text-white px-4 py-2 rounded-full shadow-lg z-[500] flex items-center gap-2 text-sm font-bold animate-pulse pointer-events-none border-2 border-amber-400">
             <AlertTriangle className="w-4 h-4" />
             DEAD RECKONING ACTIVE
           </div>
@@ -1027,14 +1030,14 @@ const App: React.FC = () => {
         {/* Controls */}
         <div className="p-4 space-y-4">
           
-          {/* Simulation Controls */}
-          <div className="flex gap-2 overflow-x-auto pb-2 border-b border-stone-100">
-             <span className="text-xs font-bold text-stone-400 uppercase self-center mr-2 shrink-0">Demo Controls:</span>
+          {/* Simulation & Recording Controls */}
+          <div className="flex gap-2 overflow-x-auto pb-2 border-b border-stone-100 scrollbar-hide">
+             <span className="text-xs font-bold text-stone-400 uppercase self-center mr-2 shrink-0">Demo:</span>
              <button 
                 onClick={() => setGpsActive(!gpsActive)}
                 className={`px-3 py-1 rounded text-xs font-bold shrink-0 transition-colors ${gpsActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}
              >
-               GPS: {gpsActive ? 'ON' : 'OFF'}
+               GPS: {gpsActive ? 'ON' : 'OFF (DR Mode)'}
              </button>
              <button 
                 onMouseDown={() => setIsSimulatingMove(true)}
@@ -1045,11 +1048,13 @@ const App: React.FC = () => {
              >
                HOLD TO MOVE
              </button>
+             <div className="h-4 w-px bg-stone-300 self-center mx-1"></div>
              <button
-               onClick={handleSensorPermission}
-               className="px-3 py-1 rounded text-xs font-bold shrink-0 bg-amber-100 text-amber-800"
+               onClick={handleToggleRecording}
+               className={`px-3 py-1 rounded text-xs font-bold shrink-0 flex items-center gap-1 transition-colors ${isRecording ? 'bg-red-100 text-red-600 border border-red-200' : 'bg-stone-100 text-stone-500'}`}
              >
-               CONNECT SENSORS
+               {isRecording ? <CircleDot className="w-3 h-3 animate-pulse" /> : <Circle className="w-3 h-3" />}
+               {isRecording ? 'REC' : 'GPX'}
              </button>
           </div>
 
@@ -1092,11 +1097,11 @@ const App: React.FC = () => {
                {navState === NavigationMode.NAVIGATING ? 'RE-ROUTE NEARBY' : 'NAVIGATE TO CLINIC'}
              </button>
              
-             {waypoints.length > 0 && (
+             {(waypoints.length > 0 || recordedTrack.length > 0) && (
                 <button 
-                  onClick={handleClearWaypoints}
+                  onClick={() => { handleClearWaypoints(); setRecordedTrack([]); setIsRecording(false); }}
                   className="bg-red-100 text-red-600 px-4 rounded-xl font-bold active:scale-[0.98] transition-transform flex flex-col items-center justify-center border border-red-200 shadow-lg"
-                  title="Clear Waypoints"
+                  title="Clear Track & Waypoints"
                 >
                    <MapIcon className="w-5 h-5" />
                    <span className="text-[10px]">CLEAR</span>
